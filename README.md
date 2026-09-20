@@ -7,3 +7,4 @@ C:\Users\ra\Downloads>python -m streamlit run streamlit_nRFGait.py
 
   Local URL: http://localhost:8501
   Network URL: http://10.87.212.112:8501
+Need to check Battery Power Consumption.  Estimated to consume 8 to mA and a 500 MAH battery to last about 50 hours. 
