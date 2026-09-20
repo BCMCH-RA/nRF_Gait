@@ -78,9 +78,9 @@
     <h2>How to use</h2>
     <ol class="howto">
       <li>Power the three modules (battery or USB) and attach them: <b>Right Leg</b>, <b>Left Leg</b>, <b>Torso</b>.</li>
-      <li>Click <b>Pair Modules (BLE)</b> — select <i>GaitIMU-RightLeg</i>, <i>GaitIMU-LeftLeg</i> and <i>GaitIMU-Torso</i> in the browser dialog (3 dialogs). Clocks are synced to Unix epoch automatically.</li>
-      <li><b>Start Streaming</b> — each card should show ≈ 200 Hz and a live acceleration trace.</li>
-      <li><b>Start Recording</b> → perform the walking trial → <b>Stop Recording</b>.</li>
+      <li>Click <b>Pair Modules (BLE)</b> — select <i>GaitIMU-RightLeg</i>, <i>GaitIMU-LeftLeg</i> and <i>GaitIMU-Torso</i> in the browser dialog (3 dialogs). Clocks are synced to Unix epoch automatically with multi-sample latency compensation.</li>
+      <li><b>Start Streaming</b> — each card should show ≈ 200 Hz and a live acceleration trace. Battery level appears on each card if the module provides it.</li>
+      <li><b>Start Recording</b> → perform the walking trial → <b>Stop Recording</b>. If a module drops out, it auto-reconnects (3 attempts) and rejoins the stream.</li>
       <li><b>Download CSV</b> — one row per sample, with the module identifier in the first column.</li>
     </ol>
     <div class="warn" id="btWarn" hidden>
@@ -90,6 +90,7 @@
     <div class="warn">
       Tip: if the buttons stay disabled when opened as a local file, serve the page instead:
       <code>python -m http.server</code> → <code>http://localhost:8000</code>.
+      Keep the tab open for the whole session — Web Bluetooth loses pairings on page reload.
     </div>
   </section>
 
@@ -130,7 +131,9 @@
   </section>
 
 </main>
-<footer>Gait data collection tool — 3 × XIAO nRF52840 Sense, 200 Hz, Web Bluetooth. Rows are interleaved per module; sort by <i>unix_time_ms</i> for chronological order.</footer>
+<footer>Gait data collection tool — 3 × XIAO nRF52840 Sense, 200 Hz, Web Bluetooth.
+Battery is a voltage-based LiPo estimate (±10–15 %). Rows are interleaved per module;
+sort by <i>unix_time_ms</i> for chronological order. Keep sessions ≤ 15–20 min per trial.</footer>
 
 <script>
 'use strict';
@@ -172,6 +175,17 @@ function log(msg){
   box.scrollTop = box.scrollHeight;
 }
 
+/* cached ISO timestamp — avoids a new Date() + full ISO string per row */
+let _isoSec = -1, _isoPre = '';
+function isoStamp(unixMs) {
+  const s = Math.floor(unixMs / 1000);
+  if (s !== _isoSec) {
+    _isoSec = s;
+    _isoPre = new Date(s * 1000).toISOString().slice(0, 20);
+  }
+  return _isoPre + String(unixMs - s * 1000).padStart(3, '0') + 'Z';
+}
+
 /* ══════════ one BLE module ══════════ */
 class ImuModule {
   constructor(device, idx){
@@ -181,12 +195,14 @@ class ImuModule {
     this.connected = false;
     this.server = null; this.svc = null;
     this.cmdChar = null; this.timeChar = null; this.dataChar = null;
+    this.batChar = null; this.battery = null; this._battLow = false;
     this.epochBaseMs = null;              /* device epoch base (host clock)   */
     this.latencyCompMs = null;            /* clock-sync link latency (ms)     */
     this._ackResolve = null;
     this.spp = SPP_DEFAULT; this.sppCap = SPP_DEFAULT; this._fallingBack = false;
     this.lastSeq = -1; this.lastRelMs = -1; this.lastPacketAt = 0;
     this._noDataWarned = false;
+    this._autoRunning = false;
     this.stats = { samples:0, packets:0, dropped:0, bad:0, rate:0, _rateWin:0 };
     this.liveT = []; this.liveA = [];     /* live chart ring buffers          */
     this.last = null;
@@ -210,24 +226,51 @@ class ImuModule {
     this.timeChar.addEventListener('characteristicvaluechanged', ev => this.onTimeAck(ev));
     await this.dataChar.startNotifications();
     this.dataChar.addEventListener('characteristicvaluechanged', ev => this.onData(ev));
+
+    /* Battery Service (optional — shows "–" if the module doesn't expose it) */
+    try {
+      const bs = await this.server.getPrimaryService('battery_service');
+      this.batChar = await bs.getCharacteristic('battery_level');
+      const bv = await this.batChar.readValue();
+      this.battery = bv.getUint8(0);
+      await this.batChar.startNotifications();
+      this.batChar.addEventListener('characteristicvaluechanged', ev => {
+        this.battery = ev.target.value.getUint8(0);
+        if (this.battery < 20 && !this._battLow) {
+          this._battLow = true;
+          log(`⚠ ${this.label()} battery low: ${this.battery} % — recharge soon.`);
+        } else if (this.battery > 25) {
+          this._battLow = false;
+        }
+        updateModuleStats();
+      });
+    } catch (e) { this.battery = null; this.batChar = null; }
+
     this.connected = true;
     this.lastPacketAt = performance.now();
   }
 
-  /* Write current Unix time; device latches its clock and ACKs. The ACK
-     round-trip lets us compensate the one-way link latency.                */
+  /* Multi-sample time sync: 4 RTT probes, then a final epoch write using
+     the best (minimum) round-trip as the one-way latency estimate.       */
   async syncTime(){
     if (!this.connected) throw new Error('not connected');
-    const now = Date.now();
+    let bestRtt = Infinity;
+    for (let i = 0; i < 4; i++) {
+      const t0 = performance.now();
+      await this.timeChar.writeValue(new Uint8Array(6).buffer);   /* probe */
+      const ack = await this._waitAck(250);
+      const t1 = performance.now();
+      if (ack !== null && (t1 - t0) < bestRtt) bestRtt = t1 - t0;
+      await new Promise(r => setTimeout(r, 30));
+    }
+    const now = Date.now();                                       /* real sync */
     const dv = new DataView(new ArrayBuffer(6));
-    dv.setUint32(0, Math.floor(now/1000), true);
+    dv.setUint32(0, Math.floor(now / 1000), true);
     dv.setUint16(4, now % 1000, true);
-    const t0 = performance.now();
     await this.timeChar.writeValue(dv.buffer);
-    const ack = await this._waitAck(800);
-    const t1 = performance.now();
-    this.latencyCompMs = (ack !== null) ? Math.round((t1 - t0) / 2) : null;
-    this.epochBaseMs = now + (this.latencyCompMs !== null ? this.latencyCompMs : 0);
+    const ok = await this._waitAck(400);
+    this.latencyCompMs = (ok !== null && bestRtt < Infinity) ? Math.round(bestRtt / 2) : 0;
+    this.epochBaseMs = now + this.latencyCompMs;
   }
   _waitAck(ms){
     return new Promise(res => {
@@ -306,7 +349,7 @@ class ImuModule {
     this.spp = 1; this.sppCap = 1;
     try {
       await this.writeCmd([CMD_SET_SPP, 1]);
-      log(`⚠ ${this.label()}: link cannot carry ${SPP_DEFAULT}-sample packets (small MTU) — switched to 1 sample/packet.`);
+      log(`⚠ ${this.label()}: link cannot carry ${SPP_DEFAULT}-sample packets — switched to 1 sample/packet.`);
     } catch(e){
       log(`⚠ ${this.label()}: packet-size switch failed: ${e.message}`);
     }
@@ -321,22 +364,48 @@ class ImuModule {
     log(`✕ ${this.label()} disconnected.`);
     updateModulePill(this);
     updateUI();
+    if (state.streaming && !this._autoRunning) {
+      this._autoRunning = true;
+      this._autoReconnect();
+    }
   }
 
-  async reconnect(){
-    if (this.connected) return;
-    try {
-      log(`… reconnecting ${this.label()} …`);
-      await this.connect();
-      await this.syncTime();               /* new epoch base (module may have rebooted) */
-      if (state.streaming) await this.startStream();
-      log(`✓ ${this.label()} reconnected${state.streaming ? ' and streaming again' : ''}.`);
-    } catch(e){
-      this.connected = false;
-      log(`✕ ${this.label()} reconnect failed: ${e.message}`);
+  async _autoReconnect(){
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await new Promise(r => setTimeout(r, attempt * 2000));
+      if (this.connected) break;              /* reconnected manually */
+      try {
+        await this._doReconnect();
+        break;
+      } catch (e) {
+        log(`✕ ${this.label()} auto-reconnect ${attempt}/3 failed: ${e.message}`);
+      }
     }
+    this._autoRunning = false;
+    if (!this.connected)
+      log(`✕ ${this.label()}: auto-reconnect exhausted — use the Reconnect button.`);
+  }
+
+  async _doReconnect(){
+    log(`… reconnecting ${this.label()}…`);
+    await this.connect();
+    await this.syncTime();                    /* new epoch base (may have rebooted) */
+    if (state.streaming) await this.startStream();
+    log(`✓ ${this.label()} reconnected${state.streaming ? ' and streaming again' : ''}.`);
     updateModulePill(this);
     updateUI();
+  }
+
+  async reconnect(){                          /* manual (Reconnect button) */
+    if (this.connected || this._autoRunning) return;
+    try {
+      await this._doReconnect();
+    } catch (e) {
+      this.connected = false;
+      log(`✕ ${this.label()} reconnect failed: ${e.message}`);
+      updateModulePill(this);
+      updateUI();
+    }
   }
 
   resetLive(){
@@ -379,6 +448,7 @@ function renderModuleCards(){
         <div><span class="k">lost / bad</span><span class="v v-lost">0 / 0</span></div>
         <div><span class="k">pkt size</span><span class="v v-spp">–</span></div>
         <div><span class="k">clock</span><span class="v v-clock">–</span></div>
+        <div><span class="k">battery</span><span class="v v-batt">–</span></div>
       </div>
       <div class="mod-latest">no sample yet</div>
       <button class="btn small btn-recon" style="background:var(--slate)">Reconnect</button>`;
@@ -393,6 +463,7 @@ function renderModuleCards(){
         lost:    card.querySelector('.v-lost'),
         spp:     card.querySelector('.v-spp'),
         clock:   card.querySelector('.v-clock'),
+        batt:    card.querySelector('.v-batt'),
         latest:  card.querySelector('.mod-latest'),
       }
     };
@@ -417,6 +488,8 @@ function updateModuleStats(){
     m.dom.els.lost.textContent    = fmtInt(m.stats.dropped) + ' / ' + fmtInt(m.stats.bad);
     m.dom.els.spp.textContent     = m.connected ? (m.spp + ' samples') : '–';
     m.dom.els.clock.textContent   = (m.latencyCompMs !== null) ? ('±' + m.latencyCompMs + ' ms') : 'not synced';
+    m.dom.els.batt.textContent    = (m.battery != null) ? (m.battery + ' %') : '–';
+    m.dom.els.batt.style.color    = (m.battery !== null && m.battery < 20) ? 'var(--red)' : '';
   }
 }
 function updateUI(){
@@ -516,7 +589,8 @@ async function pairModules(){
     while (modules.length < 3){
       log(`Pairing: choose module ${modules.length + 1} of 3 in the browser dialog…`);
       const device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [SERVICE_UUID] }]
+        filters: [{ services: [SERVICE_UUID] }],
+        optionalServices: ['battery_service']     /* needed to read battery level */
       });
       if (modules.some(m => m.device.id === device.id)){
         log('⚠ That module is already paired — choose a different one.');
@@ -528,7 +602,7 @@ async function pairModules(){
         modules.push(mod);
         try {
           await mod.syncTime();
-          log(`✓ Paired ${mod.label()} — clock synced (link latency ≈ ` +
+          log(`✓ Paired ${mod.label()} — clock synced (latency ≈ ` +
               (mod.latencyCompMs !== null ? mod.latencyCompMs + ' ms' : 'n/a') + ').');
         } catch(e){
           log(`✓ Paired ${mod.label()} — but time sync failed: ${e.message}`);
@@ -615,7 +689,7 @@ function stopRecording(){
 
 function recordSample(m, unixMs, relMs, ax, ay, az, gx, gy, gz){
   csvRows.push(
-    m.label() + ',' + unixMs + ',' + new Date(unixMs).toISOString() + ',' + relMs + ',' +
+    m.label() + ',' + unixMs + ',' + isoStamp(unixMs) + ',' + relMs + ',' +
     ax.toFixed(4) + ',' + ay.toFixed(4) + ',' + az.toFixed(4) + ',' +
     gx.toFixed(2) + ',' + gy.toFixed(2) + ',' + gz.toFixed(2)
   );
@@ -665,7 +739,7 @@ setInterval(() => {
   for (const m of modules){ m.stats.rate = m.stats._rateWin; m.stats._rateWin = 0; }
   updateModuleStats(); updateRecStats();
 }, 1000);
-setInterval(() => { drawAllCharts(); updateLatest(); }, 100);
+setInterval(() => { drawAllCharts(); updateLatest(); }, 250);   /* 250 ms = lighter */
 setInterval(watchdog, 500);
 
  $('btnPair').addEventListener('click',        () => pairModules().catch(e => log('Error: ' + e.message)));
